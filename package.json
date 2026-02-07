@@ -1,0 +1,21 @@
+{
+  "name": "stem-separation-poc",
+  "version": "1.0.0",
+  "description": "Browser-based audio stem separation POC using Transformers.js",
+  "type": "module",
+  "scripts": {
+    "dev": "npx vite",
+    "build": "npx vite build",
+    "preview": "npx vite preview"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.0.0",
+    "onnxruntime-web": "^1.18.0"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  },
+  "keywords": ["audio", "stem-separation", "transformers", "onnx", "browser"],
+  "author": "Radagast",
+  "license": "MIT"
+}
