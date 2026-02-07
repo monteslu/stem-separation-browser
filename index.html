@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stem Separation POC</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 2rem;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { color: #7b68ee; }
+    .drop-zone {
+      border: 2px dashed #7b68ee;
+      border-radius: 12px;
+      padding: 3rem;
+      text-align: center;
+      margin: 1rem 0;
+      transition: all 0.3s;
+      cursor: pointer;
+    }
+    .drop-zone:hover, .drop-zone.dragover {
+      background: rgba(123, 104, 238, 0.1);
+      border-color: #9b88ff;
+    }
+    .status {
+      padding: 1rem;
+      border-radius: 8px;
+      margin: 1rem 0;
+      background: #252547;
+    }
+    .status.loading { border-left: 4px solid #ffd700; }
+    .status.success { border-left: 4px solid #32cd32; }
+    .status.error { border-left: 4px solid #ff6347; }
+    .progress-bar {
+      width: 100%;
+      height: 8px;
+      background: #333;
+      border-radius: 4px;
+      overflow: hidden;
+      margin: 0.5rem 0;
+    }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #7b68ee, #9b88ff);
+      transition: width 0.3s;
+    }
+    audio {
+      width: 100%;
+      margin: 0.5rem 0;
+    }
+    .stem-outputs {
+      display: grid;
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+    .stem-card {
+      background: #252547;
+      padding: 1rem;
+      border-radius: 8px;
+    }
+    .stem-card h3 {
+      margin: 0 0 0.5rem 0;
+      color: #7b68ee;
+    }
+    button {
+      background: #7b68ee;
+      color: white;
+      border: none;
+      padding: 0.75rem 1.5rem;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 1rem;
+      margin: 0.5rem 0.5rem 0.5rem 0;
+    }
+    button:hover { background: #6b5bce; }
+    button:disabled { background: #555; cursor: not-allowed; }
+    .info { 
+      background: #1e3a5f; 
+      padding: 1rem; 
+      border-radius: 8px; 
+      margin: 1rem 0;
+      font-size: 0.9rem;
+    }
+    code { background: #333; padding: 2px 6px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>🎵 Stem Separation POC</h1>
+  
+  <div class="info">
+    <strong>Research Status:</strong> Exploring browser-based audio separation using Transformers.js and ONNX Runtime.
+    <br><br>
+    <strong>Current approach:</strong> Testing audio-to-audio models that might enable vocal/instrument separation.
+  </div>
+
+  <div class="drop-zone" id="dropZone">
+    <p>📁 Drop an audio file here or click to select</p>
+    <p style="font-size: 0.8rem; color: #888;">Supports: MP3, WAV, FLAC, OGG</p>
+    <input type="file" id="fileInput" accept="audio/*" hidden>
+  </div>
+
+  <div id="statusContainer"></div>
+  
+  <div id="originalAudio" style="display: none;">
+    <h3>Original Audio</h3>
+    <audio id="originalPlayer" controls></audio>
+  </div>
+
+  <div class="stem-outputs" id="stemOutputs"></div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
