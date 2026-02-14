@@ -225,8 +225,16 @@ export async function separateStems(session, audioData, sampleRate) {
   
   const results = await session.run(feeds);
   
-  const output = results[session.outputNames[0]];
-  console.warn('Output shape:', output.dims);
+  // Log all outputs
+  for (const name of session.outputNames) {
+    console.warn(`Output "${name}" shape:`, results[name].dims);
+  }
+  
+  // The model has two outputs:
+  // - outputNames[0] ("output"): STFT-domain [1, stems, channels*2, freq_bins, time_frames]
+  // - outputNames[1] ("add_67"): time-domain [1, stems, channels, samples]
+  // Use the time-domain output directly
+  const output = results[session.outputNames[1]];
   
   return { output, processLength };
 }
@@ -237,14 +245,13 @@ export function extractStems(result, sampleRate, audioContext) {
   const dims = output.dims;
   const data = output.data;
   
-  // Output shape should be [1, stems, channels, samples] or [stems, channels, samples]
+  console.warn('Extracting stems from shape:', dims);
+  
+  // Time-domain output: [1, stems, channels, samples]
   let stems, channels, samples;
   if (dims.length === 4) {
     [, stems, channels, samples] = dims;
-  } else if (dims.length === 3) {
-    [stems, channels, samples] = dims;
   } else {
-    console.warn('Unexpected output shape:', dims);
     throw new Error(`Unexpected output tensor shape: [${dims.join(', ')}]`);
   }
   
