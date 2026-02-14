@@ -10,6 +10,17 @@
  * - Alternative: Use simpler frequency-based separation as fallback
  */
 
+// Unregister any stale service workers from previous dev sessions
+// Service workers can cache HTML responses for .wasm URLs, breaking ONNX Runtime
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.getRegistrations().then(registrations => {
+    for (const registration of registrations) {
+      registration.unregister();
+      console.warn('Unregistered stale service worker:', registration.scope);
+    }
+  });
+}
+
 import { pipeline, env } from '@huggingface/transformers';
 import { loadDemucsModel, separateStems, extractStems } from './demucs-loader.js';
 
@@ -198,7 +209,7 @@ async function tryMLSeparation(audioBuffer) {
           demucsSession = await loadDemucsModel((progress) => {
             if (progress.stage === 'downloading') {
               const mb = (progress.received / 1024 / 1024).toFixed(1);
-              const totalMb = (progress.total / 1024 / 1024).toFixed(1);
+              const totalMb = progress.total ? (progress.total / 1024 / 1024).toFixed(1) : '?';
               showStatus(`📥 Downloading Demucs model: ${mb}MB / ${totalMb}MB (${progress.percent}%)`, 'loading');
               updateProgress(progress.percent);
             } else if (progress.stage === 'loading') {
@@ -343,6 +354,9 @@ fileInput.addEventListener('change', (e) => {
 });
 
 // Log info on load
-console.log('Stem Separation POC loaded');
-console.log('Using Transformers.js for potential ML-based separation');
-console.log('Fallback: frequency-based mid/side separation');
+console.warn('Stem Separation POC loaded');
+console.warn('Using Transformers.js for potential ML-based separation');
+console.warn('Fallback: frequency-based mid/side separation');
+if (typeof crossOriginIsolated !== 'undefined') {
+  console.warn('crossOriginIsolated:', crossOriginIsolated);
+}
