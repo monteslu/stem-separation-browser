@@ -84,10 +84,10 @@ function computeSTFT(getChannelData, channels, length) {
       const realChIdx = c * 2;
       const imagChIdx = c * 2 + 1;
       for (let f = 0; f < FREQ_BINS; f++) {
-        // Use bins 1..2048 (skip DC at bin 0, model uses n_fft//2 = 2048 bins)
-        const binIdx = f + 1;
-        stftData[(realChIdx * FREQ_BINS + f) * timeFrames + t] = real[binIdx] / NORM_FACTOR;
-        stftData[(imagChIdx * FREQ_BINS + f) * timeFrames + t] = imag[binIdx] / NORM_FACTOR;
+        // Bins 0..2047 (keep DC, drop Nyquist at bin 2048)
+        // htdemucs uses freqs = nfft // 2 = 2048, slicing [:2048] from stft output
+        stftData[(realChIdx * FREQ_BINS + f) * timeFrames + t] = real[f] / NORM_FACTOR;
+        stftData[(imagChIdx * FREQ_BINS + f) * timeFrames + t] = imag[f] / NORM_FACTOR;
       }
     }
   }
