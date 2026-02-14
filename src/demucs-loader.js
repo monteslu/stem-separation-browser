@@ -1,31 +1,30 @@
 /**
  * Demucs ONNX Model Loader
  * 
- * Loads and runs pre-converted Demucs ONNX models from HuggingFace.
- * The model expects two inputs:
- *   - "input": raw audio waveform [1, channels, samples]
- *   - "x": STFT spectrogram [1, channels*2, n_fft//2, time_frames]
- *     where channels*2 = [ch0_real, ch0_imag, ch1_real, ch1_imag]
+ * Loads and runs Demucs ONNX models from HuggingFace.
  * 
- * STFT must match PyTorch: center=True, normalized=True, hann_window,
- * pad_mode='reflect', n_fft=4096, hop_length=1024
+ * The STFT preprocessing must exactly match the standalone_spec() function
+ * from sevagh/demucs.onnx (demucs-for-onnx/demucs/htdemucs.py):
  * 
- * Reference: https://github.com/gianlourbano/demucs-onnx
- * PyTorch STFT: https://github.com/facebookresearch/demucs (demucs/spec.py)
+ *   1. Compute le = ceil(length / hop_length)
+ *   2. Pad signal with reflect: (pad, pad + le*hl - length) where pad = hl//2*3
+ *   3. Run STFT with center=True, normalized=True, hann_window(nfft)
+ *   4. Drop last freq bin: z[..., :-1, :]
+ *   5. Trim time frames: z[..., 2:2+le]
+ *   6. CaC (complex-as-channels): reshape [B,C,Fr,T] complex -> [B,C*2,Fr,T] real
+ *      interleaved as [ch0_real, ch0_imag, ch1_real, ch1_imag]
+ * 
+ * Reference: https://github.com/sevagh/demucs.onnx
  */
 
 import * as ort from 'onnxruntime-web';
 
-// Model URLs from HuggingFace
 const MODELS = {
   htdemucs: 'https://huggingface.co/timcsy/demucs-web-onnx/resolve/main/htdemucs_embedded.onnx',
 };
 
-// STFT parameters matching Demucs defaults (htdemucs.py + spec.py)
 const N_FFT = 4096;
-const HOP_LENGTH = 1024; // n_fft // 4
-const WIN_LENGTH = 4096;
-const FREQ_BINS = 2048;  // n_fft // 2 (drop Nyquist bin)
+const HOP_LENGTH = 1024; // nfft // 4
 const NORM_FACTOR = Math.sqrt(N_FFT); // PyTorch normalized=True
 
 // Configure ONNX Runtime
@@ -37,69 +36,114 @@ if (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated) {
 ort.env.wasm.simd = true;
 
 /**
- * Compute STFT matching PyTorch's torch.stft with:
- *   center=True, normalized=True, hann_window, pad_mode='reflect'
- * 
- * Returns rank-4 data: [channels*2, FREQ_BINS, time_frames]
- * where channels*2 interleaves real/imag per channel
+ * Reflect-pad a Float32Array on both sides
  */
-function computeSTFT(getChannelData, channels, length) {
-  // center=True: frames = floor(length / hop) + 1
-  const timeFrames = Math.floor(length / HOP_LENGTH) + 1;
-  const pad = Math.floor(N_FFT / 2);
+function reflectPad(data, padLeft, padRight) {
+  const len = data.length;
+  const out = new Float32Array(padLeft + len + padRight);
+  // Copy original
+  out.set(data, padLeft);
+  // Reflect left
+  for (let i = 0; i < padLeft; i++) {
+    const srcIdx = padLeft - i; // reflect index
+    out[i] = srcIdx < len ? data[srcIdx] : data[len - 1];
+  }
+  // Reflect right
+  for (let i = 0; i < padRight; i++) {
+    const srcIdx = len - 2 - i; // reflect index
+    out[padLeft + len + i] = srcIdx >= 0 ? data[srcIdx] : data[0];
+  }
+  return out;
+}
+
+/**
+ * Compute the spectrogram matching standalone_spec() from demucs ONNX export.
+ * 
+ * Returns: { data: Float32Array, totalChannels, freqBins, timeFrames }
+ * Shape: [totalChannels, freqBins, timeFrames] ready for [1, ...] tensor
+ */
+function computeDemucsSpec(getChannelData, channels, length) {
+  const hl = HOP_LENGTH;
+  const le = Math.ceil(length / hl); // target number of output frames
+  const pad = Math.floor(hl / 2) * 3; // 1536
+  const rightPad = pad + le * hl - length;
   
-  // Hann window (matching PyTorch's torch.hann_window)
-  const window = new Float32Array(WIN_LENGTH);
-  for (let i = 0; i < WIN_LENGTH; i++) {
-    window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / WIN_LENGTH));
+  // Hann window
+  const window = new Float32Array(N_FFT);
+  for (let i = 0; i < N_FFT; i++) {
+    window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / N_FFT));
   }
   
-  const totalChannels = channels * 2; // real + imag per channel
-  const stftData = new Float32Array(totalChannels * FREQ_BINS * timeFrames);
+  // After padding, the signal length is: pad + length + rightPad = 2*pad + le*hl
+  // spectro() uses center=True which adds nfft//2 padding on each side
+  // Total padded length for STFT: paddedLen + nfft
+  // Number of STFT frames: floor(paddedSignalLen / hl) + 1 (with center=True)
+  const paddedLen = pad + length + rightPad;
+  const centerPad = Math.floor(N_FFT / 2);
+  const totalLen = centerPad + paddedLen + centerPad;
+  const totalFrames = Math.floor(paddedLen / hl) + 1;
+  
+  // After spectro: shape [C, n_fft//2+1, totalFrames] (complex)
+  // Drop last freq bin: [C, n_fft//2, totalFrames]  (:-1 on freq axis)
+  // Trim frames: [C, n_fft//2, le]  (2:2+le on time axis)
+  const freqBins = Math.floor(N_FFT / 2); // 2048
+  const timeFrames = le; // target output frames
+  
+  const totalChannels = channels * 2;
+  const stftData = new Float32Array(totalChannels * freqBins * timeFrames);
   
   for (let c = 0; c < channels; c++) {
-    const channelData = getChannelData(c);
+    const rawChannel = getChannelData(c);
     
-    for (let t = 0; t < timeFrames; t++) {
-      // center=True: frame center at t * HOP_LENGTH
-      const frameStart = t * HOP_LENGTH - pad;
+    // Step 1: reflect pad the raw signal
+    const paddedSignal = reflectPad(rawChannel, pad, rightPad);
+    
+    // Step 2: For each STFT frame (with center=True padding)
+    for (let t = 0; t < totalFrames; t++) {
+      // With center=True, frame starts at t*hl - centerPad in the padded signal
+      const frameStart = t * hl - centerPad;
       
       const real = new Float32Array(N_FFT);
       const imag = new Float32Array(N_FFT);
       
-      for (let i = 0; i < WIN_LENGTH; i++) {
+      for (let i = 0; i < N_FFT; i++) {
         let idx = frameStart + i;
-        // Reflect padding (PyTorch pad_mode='reflect')
+        // Reflect at boundaries of the padded signal
         if (idx < 0) idx = -idx;
-        if (idx >= length) idx = 2 * length - idx - 2;
-        // Clamp for safety
-        idx = Math.max(0, Math.min(length - 1, idx));
-        real[i] = channelData[idx] * window[i];
+        if (idx >= paddedLen) idx = 2 * paddedLen - idx - 2;
+        idx = Math.max(0, Math.min(paddedLen - 1, idx));
+        real[i] = paddedSignal[idx] * window[i];
       }
       
-      // In-place radix-2 FFT
       fft(real, imag, N_FFT);
       
-      // Normalize (PyTorch normalized=True divides by sqrt(n_fft))
-      const realChIdx = c * 2;
-      const imagChIdx = c * 2 + 1;
-      for (let f = 0; f < FREQ_BINS; f++) {
-        // Bins 0..2047 (keep DC, drop Nyquist at bin 2048)
-        // htdemucs uses freqs = nfft // 2 = 2048, slicing [:2048] from stft output
-        stftData[(realChIdx * FREQ_BINS + f) * timeFrames + t] = real[f] / NORM_FACTOR;
-        stftData[(imagChIdx * FREQ_BINS + f) * timeFrames + t] = imag[f] / NORM_FACTOR;
+      // Normalize (PyTorch normalized=True)
+      for (let f = 0; f < N_FFT; f++) {
+        real[f] /= NORM_FACTOR;
+        imag[f] /= NORM_FACTOR;
+      }
+      
+      // Only store if this frame is in the trimmed range [2, 2+le)
+      const outT = t - 2;
+      if (outT >= 0 && outT < timeFrames) {
+        const realChIdx = c * 2;
+        const imagChIdx = c * 2 + 1;
+        for (let f = 0; f < freqBins; f++) {
+          // Bins 0..2047 (drop bin 2048 = Nyquist, i.e. [:-1] on freq axis)
+          stftData[(realChIdx * freqBins + f) * timeFrames + outT] = real[f];
+          stftData[(imagChIdx * freqBins + f) * timeFrames + outT] = imag[f];
+        }
       }
     }
   }
   
-  return { data: stftData, totalChannels, timeFrames };
+  return { data: stftData, totalChannels, freqBins, timeFrames };
 }
 
 /**
  * In-place Cooley-Tukey FFT (radix-2, DIT)
  */
 function fft(real, imag, n) {
-  // Bit-reversal permutation
   let j = 0;
   for (let i = 0; i < n - 1; i++) {
     if (i < j) {
@@ -114,7 +158,6 @@ function fft(real, imag, n) {
     j += k;
   }
   
-  // Butterfly operations
   for (let len = 2; len <= n; len <<= 1) {
     const halfLen = len >> 1;
     const angle = -2 * Math.PI / len;
@@ -212,10 +255,12 @@ async function processChunk(session, audioData, channels, offset, chunkSize) {
   
   const inputTensor = new ort.Tensor('float32', inputData, [1, channels, chunkSize]);
   
-  // Compute STFT matching PyTorch spec.py
+  // Compute spectrogram matching standalone_spec + standalone_magnitude
   const getChannelData = (c) => inputData.subarray(c * chunkSize, (c + 1) * chunkSize);
-  const { data: stftData, totalChannels, timeFrames } = computeSTFT(getChannelData, channels, chunkSize);
-  const stftTensor = new ort.Tensor('float32', stftData, [1, totalChannels, FREQ_BINS, timeFrames]);
+  const { data: stftData, totalChannels, freqBins, timeFrames } = computeDemucsSpec(getChannelData, channels, chunkSize);
+  const stftTensor = new ort.Tensor('float32', stftData, [1, totalChannels, freqBins, timeFrames]);
+  
+  console.warn(`  Chunk STFT shape: [1, ${totalChannels}, ${freqBins}, ${timeFrames}]`);
   
   const feeds = {};
   feeds[session.inputNames[0]] = inputTensor;
@@ -232,9 +277,9 @@ export async function separateStems(session, audioData, sampleRate, onProgress) 
   const channels = audioData.numberOfChannels;
   const length = audioData.length;
   
-  // htdemucs_embedded model expects exactly 343980 samples per chunk (~7.8s at 44.1kHz)
+  // htdemucs_embedded: segment=10s at 44100Hz, but model expects 343980 samples
   const CHUNK_SIZE = 343980;
-  const OVERLAP = Math.floor(CHUNK_SIZE * 0.25); // 25% overlap
+  const OVERLAP = Math.floor(CHUNK_SIZE * 0.25);
   const STEP = CHUNK_SIZE - OVERLAP;
   const NUM_STEMS = 4;
   
@@ -243,7 +288,6 @@ export async function separateStems(session, audioData, sampleRate, onProgress) 
   console.warn(`Processing ${numChunks} chunk(s) of ${CHUNK_SIZE} samples (${(CHUNK_SIZE/sampleRate).toFixed(1)}s each)`);
   console.warn(`Total audio: ${(length/sampleRate).toFixed(1)}s, overlap: ${(OVERLAP/sampleRate).toFixed(1)}s`);
   
-  // Allocate output buffers
   const outputLength = Math.max(length, CHUNK_SIZE);
   const stemData = new Array(NUM_STEMS);
   const weightSum = new Float32Array(outputLength);
@@ -254,7 +298,6 @@ export async function separateStems(session, audioData, sampleRate, onProgress) 
     }
   }
   
-  // Crossfade window
   const fadeLen = OVERLAP;
   const fadeWindow = new Float32Array(CHUNK_SIZE);
   for (let i = 0; i < CHUNK_SIZE; i++) {
@@ -295,7 +338,6 @@ export async function separateStems(session, audioData, sampleRate, onProgress) 
     }
   }
   
-  // Normalize by weight sum
   for (let s = 0; s < NUM_STEMS; s++) {
     for (let c = 0; c < channels; c++) {
       for (let i = 0; i < length; i++) {
@@ -318,11 +360,9 @@ export function extractStems(result, sampleRate, audioContext) {
   
   for (let s = 0; s < numStems; s++) {
     const buffer = audioContext.createBuffer(channels, length, sampleRate);
-    
     for (let c = 0; c < channels; c++) {
       buffer.getChannelData(c).set(stemData[s][c].subarray(0, length));
     }
-    
     buffers[stemNames[s]] = buffer;
   }
   
