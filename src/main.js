@@ -168,11 +168,15 @@ async function processAudio(file) {
       throw new Error('Failed to load Demucs model');
     }
 
-    showStatus('🎵 Running stem separation... (this may take a while)', 'loading');
-    updateProgress(50);
+    const duration = audioBuffer.duration.toFixed(0);
+    showStatus(`🎵 Running stem separation on ${duration}s of audio... (this may take a while)`, 'loading');
+    updateProgress(10);
 
-    const output = await separateStems(session, audioBuffer, audioBuffer.sampleRate);
-    const stems = extractStems(output, audioBuffer.sampleRate, getAudioContext());
+    const result = await separateStems(session, audioBuffer, audioBuffer.sampleRate);
+    
+    showStatus('🎵 Extracting stems...', 'loading');
+    updateProgress(90);
+    const stems = extractStems(result, audioBuffer.sampleRate, getAudioContext());
 
     updateProgress(100);
 
