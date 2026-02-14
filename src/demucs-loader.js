@@ -31,11 +31,13 @@ if (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated) {
 ort.env.wasm.simd = true;
 
 /**
- * Compute STFT of audio data (real + imaginary components)
- * Returns Float32Array with shape [channels, freq_bins, time_frames, 2]
+ * Compute STFT of audio data
+ * Returns Float32Array with shape [channels*2, freq_bins, time_frames]
+ * where channels*2 interleaves real and imaginary: [ch0_real, ch0_imag, ch1_real, ch1_imag, ...]
+ * The model expects rank-4 input: [1, channels*2, freq_bins, time_frames]
  */
 function computeSTFT(audioData, channels, length) {
-  const freqBins = Math.floor(N_FFT / 2) + 1; // 2049
+  const freqBins = Math.floor(N_FFT / 2); // 2048 (drop DC+Nyquist symmetry)
   const timeFrames = Math.floor((length - N_FFT) / HOP_LENGTH) + 1;
   
   // Hann window
@@ -44,7 +46,8 @@ function computeSTFT(audioData, channels, length) {
     window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / WIN_LENGTH));
   }
   
-  const stftData = new Float32Array(channels * freqBins * timeFrames * 2);
+  const totalChannels = channels * 2; // real + imag per channel
+  const stftData = new Float32Array(totalChannels * freqBins * timeFrames);
   
   for (let c = 0; c < channels; c++) {
     const channelData = audioData.getChannelData(c);
@@ -52,7 +55,6 @@ function computeSTFT(audioData, channels, length) {
     for (let t = 0; t < timeFrames; t++) {
       const start = t * HOP_LENGTH;
       
-      // Apply window and compute FFT for this frame
       const real = new Float32Array(N_FFT);
       const imag = new Float32Array(N_FFT);
       
@@ -62,19 +64,19 @@ function computeSTFT(audioData, channels, length) {
         }
       }
       
-      // In-place FFT (Cooley-Tukey radix-2)
       fft(real, imag, N_FFT);
       
-      // Store only positive frequencies (0 to N_FFT/2 inclusive)
+      // Store real part for this channel
+      const realChIdx = c * 2;
+      const imagChIdx = c * 2 + 1;
       for (let f = 0; f < freqBins; f++) {
-        const idx = ((c * freqBins + f) * timeFrames + t) * 2;
-        stftData[idx] = real[f];     // real part
-        stftData[idx + 1] = imag[f]; // imaginary part
+        stftData[(realChIdx * freqBins + f) * timeFrames + t] = real[f + 1]; // skip DC
+        stftData[(imagChIdx * freqBins + f) * timeFrames + t] = imag[f + 1];
       }
     }
   }
   
-  return { data: stftData, freqBins, timeFrames };
+  return { data: stftData, totalChannels, freqBins, timeFrames };
 }
 
 /**
@@ -197,10 +199,10 @@ export async function separateStems(session, audioData, sampleRate) {
   
   const inputTensor = new ort.Tensor('float32', inputData, [1, channels, processLength]);
   
-  // Compute STFT for second input
+  // Compute STFT for second input (rank 4: [1, channels*2, freq_bins, time_frames])
   console.warn('Computing STFT...');
-  const { data: stftData, freqBins, timeFrames } = computeSTFT(audioData, channels, processLength);
-  const stftTensor = new ort.Tensor('float32', stftData, [1, channels, freqBins, timeFrames, 2]);
+  const { data: stftData, totalChannels, freqBins, timeFrames } = computeSTFT(audioData, channels, processLength);
+  const stftTensor = new ort.Tensor('float32', stftData, [1, totalChannels, freqBins, timeFrames]);
   
   console.warn('Running inference...');
   console.warn('Input "input" shape:', inputTensor.dims);
