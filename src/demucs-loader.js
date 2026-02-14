@@ -182,8 +182,8 @@ export async function separateStems(session, audioData, sampleRate) {
   const length = audioData.length;
   
   // Pad/truncate to a length that's a power-of-2 friendly for STFT
-  // Demucs reference uses chunks of 441000 samples (~10s at 44.1kHz)
-  const CHUNK_SIZE = 441000;
+  // htdemucs_embedded model expects exactly 343980 samples (~7.8s at 44.1kHz)
+  const CHUNK_SIZE = 343980;
   const processLength = Math.min(length, CHUNK_SIZE);
   
   // Prepare raw audio tensor: [1, channels, samples]
