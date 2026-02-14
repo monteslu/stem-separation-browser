@@ -4,10 +4,14 @@
  * Loads and runs pre-converted Demucs ONNX models from HuggingFace.
  * The model expects two inputs:
  *   - "input": raw audio waveform [1, channels, samples]
- *   - "x": STFT spectrogram [1, channels, freq_bins, time_frames, 2] (real+imag)
+ *   - "x": STFT spectrogram [1, channels*2, n_fft//2, time_frames]
+ *     where channels*2 = [ch0_real, ch0_imag, ch1_real, ch1_imag]
  * 
- * STFT is computed in JS because torch STFT/iSTFT can't be exported to ONNX.
+ * STFT must match PyTorch: center=True, normalized=True, hann_window,
+ * pad_mode='reflect', n_fft=4096, hop_length=1024
+ * 
  * Reference: https://github.com/gianlourbano/demucs-onnx
+ * PyTorch STFT: https://github.com/facebookresearch/demucs (demucs/spec.py)
  */
 
 import * as ort from 'onnxruntime-web';
@@ -17,10 +21,12 @@ const MODELS = {
   htdemucs: 'https://huggingface.co/timcsy/demucs-web-onnx/resolve/main/htdemucs_embedded.onnx',
 };
 
-// STFT parameters matching Demucs defaults
+// STFT parameters matching Demucs defaults (htdemucs.py + spec.py)
 const N_FFT = 4096;
-const HOP_LENGTH = 1024;
+const HOP_LENGTH = 1024; // n_fft // 4
 const WIN_LENGTH = 4096;
+const FREQ_BINS = 2048;  // n_fft // 2 (drop Nyquist bin)
+const NORM_FACTOR = Math.sqrt(N_FFT); // PyTorch normalized=True
 
 // Configure ONNX Runtime
 if (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated) {
@@ -31,62 +37,62 @@ if (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated) {
 ort.env.wasm.simd = true;
 
 /**
- * Compute STFT of audio data
- * Returns Float32Array with shape [channels*2, freq_bins, time_frames]
- * where channels*2 interleaves real and imaginary: [ch0_real, ch0_imag, ch1_real, ch1_imag, ...]
- * The model expects rank-4 input: [1, channels*2, freq_bins, time_frames]
+ * Compute STFT matching PyTorch's torch.stft with:
+ *   center=True, normalized=True, hann_window, pad_mode='reflect'
+ * 
+ * Returns rank-4 data: [channels*2, FREQ_BINS, time_frames]
+ * where channels*2 interleaves real/imag per channel
  */
-function computeSTFT(audioData, channels, length) {
-  const freqBins = Math.floor(N_FFT / 2); // 2048
-  // center=True (PyTorch default): pad n_fft//2 on each side
-  // frames = floor(length / hop) + 1
-  const pad = Math.floor(N_FFT / 2);
-  const paddedLength = length + 2 * pad;
+function computeSTFT(getChannelData, channels, length) {
+  // center=True: frames = floor(length / hop) + 1
   const timeFrames = Math.floor(length / HOP_LENGTH) + 1;
+  const pad = Math.floor(N_FFT / 2);
   
-  // Hann window
+  // Hann window (matching PyTorch's torch.hann_window)
   const window = new Float32Array(WIN_LENGTH);
   for (let i = 0; i < WIN_LENGTH; i++) {
     window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / WIN_LENGTH));
   }
   
   const totalChannels = channels * 2; // real + imag per channel
-  const stftData = new Float32Array(totalChannels * freqBins * timeFrames);
+  const stftData = new Float32Array(totalChannels * FREQ_BINS * timeFrames);
   
   for (let c = 0; c < channels; c++) {
-    const channelData = audioData.getChannelData(c);
+    const channelData = getChannelData(c);
     
     for (let t = 0; t < timeFrames; t++) {
-      // With center padding, frame center is at t * HOP_LENGTH
-      // Frame starts at t * HOP_LENGTH - pad (in original signal coords)
+      // center=True: frame center at t * HOP_LENGTH
       const frameStart = t * HOP_LENGTH - pad;
       
       const real = new Float32Array(N_FFT);
       const imag = new Float32Array(N_FFT);
       
       for (let i = 0; i < WIN_LENGTH; i++) {
-        const sampleIdx = frameStart + i;
-        // Reflect padding at boundaries (PyTorch default pad_mode='reflect')
-        let idx = sampleIdx;
+        let idx = frameStart + i;
+        // Reflect padding (PyTorch pad_mode='reflect')
         if (idx < 0) idx = -idx;
         if (idx >= length) idx = 2 * length - idx - 2;
-        if (idx >= 0 && idx < length) {
-          real[i] = channelData[idx] * window[i];
-        }
+        // Clamp for safety
+        idx = Math.max(0, Math.min(length - 1, idx));
+        real[i] = channelData[idx] * window[i];
       }
       
+      // In-place radix-2 FFT
       fft(real, imag, N_FFT);
       
+      // Normalize (PyTorch normalized=True divides by sqrt(n_fft))
       const realChIdx = c * 2;
       const imagChIdx = c * 2 + 1;
-      for (let f = 0; f < freqBins; f++) {
-        stftData[(realChIdx * freqBins + f) * timeFrames + t] = real[f + 1]; // skip DC
-        stftData[(imagChIdx * freqBins + f) * timeFrames + t] = imag[f + 1];
+      for (let f = 0; f < FREQ_BINS; f++) {
+        // Use bins 1..2048 (skip DC at bin 0, model uses n_fft//2 = 2048 bins)
+        const binIdx = f + 1;
+        stftData[(realChIdx * FREQ_BINS + f) * timeFrames + t] = real[binIdx] / NORM_FACTOR;
+        stftData[(imagChIdx * FREQ_BINS + f) * timeFrames + t] = imag[binIdx] / NORM_FACTOR;
       }
     }
   }
   
-  return { data: stftData, totalChannels, freqBins, timeFrames };
+  return { data: stftData, totalChannels, timeFrames };
 }
 
 /**
@@ -201,23 +207,15 @@ async function processChunk(session, audioData, channels, offset, chunkSize) {
       if (srcIdx >= 0 && srcIdx < length) {
         inputData[c * chunkSize + i] = channelData[srcIdx];
       }
-      // else: zero-padded
     }
   }
   
   const inputTensor = new ort.Tensor('float32', inputData, [1, channels, chunkSize]);
   
-  // Build a temporary AudioBuffer-like object for STFT computation
-  const chunkAudioData = {
-    numberOfChannels: channels,
-    length: chunkSize,
-    getChannelData(c) {
-      return inputData.subarray(c * chunkSize, (c + 1) * chunkSize);
-    }
-  };
-  
-  const { data: stftData, totalChannels, freqBins, timeFrames } = computeSTFT(chunkAudioData, channels, chunkSize);
-  const stftTensor = new ort.Tensor('float32', stftData, [1, totalChannels, freqBins, timeFrames]);
+  // Compute STFT matching PyTorch spec.py
+  const getChannelData = (c) => inputData.subarray(c * chunkSize, (c + 1) * chunkSize);
+  const { data: stftData, totalChannels, timeFrames } = computeSTFT(getChannelData, channels, chunkSize);
+  const stftTensor = new ort.Tensor('float32', stftData, [1, totalChannels, FREQ_BINS, timeFrames]);
   
   const feeds = {};
   feeds[session.inputNames[0]] = inputTensor;
@@ -230,18 +228,16 @@ async function processChunk(session, audioData, channels, offset, chunkSize) {
 }
 
 // Run inference with chunked processing for full-length audio
-export async function separateStems(session, audioData, sampleRate) {
+export async function separateStems(session, audioData, sampleRate, onProgress) {
   const channels = audioData.numberOfChannels;
   const length = audioData.length;
   
   // htdemucs_embedded model expects exactly 343980 samples per chunk (~7.8s at 44.1kHz)
   const CHUNK_SIZE = 343980;
-  // Overlap between chunks for smooth crossfading
   const OVERLAP = Math.floor(CHUNK_SIZE * 0.25); // 25% overlap
   const STEP = CHUNK_SIZE - OVERLAP;
   const NUM_STEMS = 4;
   
-  // Calculate number of chunks needed
   const numChunks = Math.max(1, Math.ceil((length - OVERLAP) / STEP));
   
   console.warn(`Processing ${numChunks} chunk(s) of ${CHUNK_SIZE} samples (${(CHUNK_SIZE/sampleRate).toFixed(1)}s each)`);
@@ -258,23 +254,24 @@ export async function separateStems(session, audioData, sampleRate) {
     }
   }
   
-  // Create crossfade window
+  // Crossfade window
   const fadeLen = OVERLAP;
-  const fadeIn = new Float32Array(CHUNK_SIZE);
+  const fadeWindow = new Float32Array(CHUNK_SIZE);
   for (let i = 0; i < CHUNK_SIZE; i++) {
     if (i < fadeLen) {
-      fadeIn[i] = i / fadeLen; // ramp up
+      fadeWindow[i] = i / fadeLen;
     } else if (i >= CHUNK_SIZE - fadeLen) {
-      fadeIn[i] = (CHUNK_SIZE - i) / fadeLen; // ramp down
+      fadeWindow[i] = (CHUNK_SIZE - i) / fadeLen;
     } else {
-      fadeIn[i] = 1.0;
+      fadeWindow[i] = 1.0;
     }
   }
-  // First and last chunks: don't fade at boundaries
   
   for (let chunk = 0; chunk < numChunks; chunk++) {
     const offset = chunk * STEP;
-    console.warn(`Chunk ${chunk + 1}/${numChunks} (offset: ${offset})`);
+    const pct = Math.round(((chunk + 1) / numChunks) * 100);
+    console.warn(`Chunk ${chunk + 1}/${numChunks} (offset: ${offset}, ${pct}%)`);
+    onProgress?.({ chunk: chunk + 1, total: numChunks, percent: pct });
     
     const output = await processChunk(session, audioData, channels, offset, CHUNK_SIZE);
     const data = output.data;
@@ -285,10 +282,8 @@ export async function separateStems(session, audioData, sampleRate) {
         for (let i = 0; i < samples; i++) {
           const outIdx = offset + i;
           if (outIdx < outputLength) {
-            let weight = fadeIn[i];
-            // Don't fade in at the start of the first chunk
+            let weight = fadeWindow[i];
             if (chunk === 0 && i < fadeLen) weight = 1.0;
-            // Don't fade out at the end of the last chunk
             if (chunk === numChunks - 1 && i >= CHUNK_SIZE - fadeLen) weight = 1.0;
             
             const srcIdx = s * ch * samples + c * samples + i;
