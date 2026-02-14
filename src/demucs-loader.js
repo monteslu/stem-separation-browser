@@ -37,8 +37,12 @@ ort.env.wasm.simd = true;
  * The model expects rank-4 input: [1, channels*2, freq_bins, time_frames]
  */
 function computeSTFT(audioData, channels, length) {
-  const freqBins = Math.floor(N_FFT / 2); // 2048 (drop DC+Nyquist symmetry)
-  const timeFrames = Math.floor((length - N_FFT) / HOP_LENGTH) + 1;
+  const freqBins = Math.floor(N_FFT / 2); // 2048
+  // center=True (PyTorch default): pad n_fft//2 on each side
+  // frames = floor(length / hop) + 1
+  const pad = Math.floor(N_FFT / 2);
+  const paddedLength = length + 2 * pad;
+  const timeFrames = Math.floor(length / HOP_LENGTH) + 1;
   
   // Hann window
   const window = new Float32Array(WIN_LENGTH);
@@ -53,20 +57,26 @@ function computeSTFT(audioData, channels, length) {
     const channelData = audioData.getChannelData(c);
     
     for (let t = 0; t < timeFrames; t++) {
-      const start = t * HOP_LENGTH;
+      // With center padding, frame center is at t * HOP_LENGTH
+      // Frame starts at t * HOP_LENGTH - pad (in original signal coords)
+      const frameStart = t * HOP_LENGTH - pad;
       
       const real = new Float32Array(N_FFT);
       const imag = new Float32Array(N_FFT);
       
       for (let i = 0; i < WIN_LENGTH; i++) {
-        if (start + i < length) {
-          real[i] = channelData[start + i] * window[i];
+        const sampleIdx = frameStart + i;
+        // Reflect padding at boundaries (PyTorch default pad_mode='reflect')
+        let idx = sampleIdx;
+        if (idx < 0) idx = -idx;
+        if (idx >= length) idx = 2 * length - idx - 2;
+        if (idx >= 0 && idx < length) {
+          real[i] = channelData[idx] * window[i];
         }
       }
       
       fft(real, imag, N_FFT);
       
-      // Store real part for this channel
       const realChIdx = c * 2;
       const imagChIdx = c * 2 + 1;
       for (let f = 0; f < freqBins; f++) {
