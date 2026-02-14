@@ -188,86 +188,144 @@ export async function loadDemucsModel(progressCallback) {
   return session;
 }
 
-// Run inference
-export async function separateStems(session, audioData, sampleRate) {
-  const channels = audioData.numberOfChannels;
+// Process a single chunk through the model
+async function processChunk(session, audioData, channels, offset, chunkSize) {
   const length = audioData.length;
   
-  // Pad/truncate to a length that's a power-of-2 friendly for STFT
-  // htdemucs_embedded model expects exactly 343980 samples (~7.8s at 44.1kHz)
-  const CHUNK_SIZE = 343980;
-  const processLength = Math.min(length, CHUNK_SIZE);
-  
-  // Prepare raw audio tensor: [1, channels, samples]
-  const inputData = new Float32Array(channels * processLength);
+  // Prepare raw audio tensor: [1, channels, chunkSize]
+  const inputData = new Float32Array(channels * chunkSize);
   for (let c = 0; c < channels; c++) {
     const channelData = audioData.getChannelData(c);
-    for (let i = 0; i < processLength; i++) {
-      inputData[c * processLength + i] = channelData[i];
+    for (let i = 0; i < chunkSize; i++) {
+      const srcIdx = offset + i;
+      if (srcIdx >= 0 && srcIdx < length) {
+        inputData[c * chunkSize + i] = channelData[srcIdx];
+      }
+      // else: zero-padded
     }
   }
   
-  const inputTensor = new ort.Tensor('float32', inputData, [1, channels, processLength]);
+  const inputTensor = new ort.Tensor('float32', inputData, [1, channels, chunkSize]);
   
-  // Compute STFT for second input (rank 4: [1, channels*2, freq_bins, time_frames])
-  console.warn('Computing STFT...');
-  const { data: stftData, totalChannels, freqBins, timeFrames } = computeSTFT(audioData, channels, processLength);
+  // Build a temporary AudioBuffer-like object for STFT computation
+  const chunkAudioData = {
+    numberOfChannels: channels,
+    length: chunkSize,
+    getChannelData(c) {
+      return inputData.subarray(c * chunkSize, (c + 1) * chunkSize);
+    }
+  };
+  
+  const { data: stftData, totalChannels, freqBins, timeFrames } = computeSTFT(chunkAudioData, channels, chunkSize);
   const stftTensor = new ort.Tensor('float32', stftData, [1, totalChannels, freqBins, timeFrames]);
   
-  console.warn('Running inference...');
-  console.warn('Input "input" shape:', inputTensor.dims);
-  console.warn('Input "x" shape:', stftTensor.dims);
-  
-  // Build feeds using actual input names from the model
   const feeds = {};
   feeds[session.inputNames[0]] = inputTensor;
   feeds[session.inputNames[1]] = stftTensor;
   
   const results = await session.run(feeds);
   
-  // Log all outputs
-  for (const name of session.outputNames) {
-    console.warn(`Output "${name}" shape:`, results[name].dims);
+  // Use time-domain output [1, stems, channels, samples]
+  return results[session.outputNames[1]];
+}
+
+// Run inference with chunked processing for full-length audio
+export async function separateStems(session, audioData, sampleRate) {
+  const channels = audioData.numberOfChannels;
+  const length = audioData.length;
+  
+  // htdemucs_embedded model expects exactly 343980 samples per chunk (~7.8s at 44.1kHz)
+  const CHUNK_SIZE = 343980;
+  // Overlap between chunks for smooth crossfading
+  const OVERLAP = Math.floor(CHUNK_SIZE * 0.25); // 25% overlap
+  const STEP = CHUNK_SIZE - OVERLAP;
+  const NUM_STEMS = 4;
+  
+  // Calculate number of chunks needed
+  const numChunks = Math.max(1, Math.ceil((length - OVERLAP) / STEP));
+  
+  console.warn(`Processing ${numChunks} chunk(s) of ${CHUNK_SIZE} samples (${(CHUNK_SIZE/sampleRate).toFixed(1)}s each)`);
+  console.warn(`Total audio: ${(length/sampleRate).toFixed(1)}s, overlap: ${(OVERLAP/sampleRate).toFixed(1)}s`);
+  
+  // Allocate output buffers
+  const outputLength = Math.max(length, CHUNK_SIZE);
+  const stemData = new Array(NUM_STEMS);
+  const weightSum = new Float32Array(outputLength);
+  for (let s = 0; s < NUM_STEMS; s++) {
+    stemData[s] = new Array(channels);
+    for (let c = 0; c < channels; c++) {
+      stemData[s][c] = new Float32Array(outputLength);
+    }
   }
   
-  // The model has two outputs:
-  // - outputNames[0] ("output"): STFT-domain [1, stems, channels*2, freq_bins, time_frames]
-  // - outputNames[1] ("add_67"): time-domain [1, stems, channels, samples]
-  // Use the time-domain output directly
-  const output = results[session.outputNames[1]];
+  // Create crossfade window
+  const fadeLen = OVERLAP;
+  const fadeIn = new Float32Array(CHUNK_SIZE);
+  for (let i = 0; i < CHUNK_SIZE; i++) {
+    if (i < fadeLen) {
+      fadeIn[i] = i / fadeLen; // ramp up
+    } else if (i >= CHUNK_SIZE - fadeLen) {
+      fadeIn[i] = (CHUNK_SIZE - i) / fadeLen; // ramp down
+    } else {
+      fadeIn[i] = 1.0;
+    }
+  }
+  // First and last chunks: don't fade at boundaries
   
-  return { output, processLength };
+  for (let chunk = 0; chunk < numChunks; chunk++) {
+    const offset = chunk * STEP;
+    console.warn(`Chunk ${chunk + 1}/${numChunks} (offset: ${offset})`);
+    
+    const output = await processChunk(session, audioData, channels, offset, CHUNK_SIZE);
+    const data = output.data;
+    const [, stems, ch, samples] = output.dims;
+    
+    for (let s = 0; s < stems; s++) {
+      for (let c = 0; c < ch; c++) {
+        for (let i = 0; i < samples; i++) {
+          const outIdx = offset + i;
+          if (outIdx < outputLength) {
+            let weight = fadeIn[i];
+            // Don't fade in at the start of the first chunk
+            if (chunk === 0 && i < fadeLen) weight = 1.0;
+            // Don't fade out at the end of the last chunk
+            if (chunk === numChunks - 1 && i >= CHUNK_SIZE - fadeLen) weight = 1.0;
+            
+            const srcIdx = s * ch * samples + c * samples + i;
+            stemData[s][c][outIdx] += data[srcIdx] * weight;
+            if (s === 0 && c === 0) weightSum[outIdx] += weight;
+          }
+        }
+      }
+    }
+  }
+  
+  // Normalize by weight sum
+  for (let s = 0; s < NUM_STEMS; s++) {
+    for (let c = 0; c < channels; c++) {
+      for (let i = 0; i < length; i++) {
+        if (weightSum[i] > 0) {
+          stemData[s][c][i] /= weightSum[i];
+        }
+      }
+    }
+  }
+  
+  return { stemData, channels, length, numStems: NUM_STEMS };
 }
 
 // Export stems as audio buffers
 export function extractStems(result, sampleRate, audioContext) {
-  const { output, processLength } = result;
-  const dims = output.dims;
-  const data = output.data;
-  
-  console.warn('Extracting stems from shape:', dims);
-  
-  // Time-domain output: [1, stems, channels, samples]
-  let stems, channels, samples;
-  if (dims.length === 4) {
-    [, stems, channels, samples] = dims;
-  } else {
-    throw new Error(`Unexpected output tensor shape: [${dims.join(', ')}]`);
-  }
+  const { stemData, channels, length, numStems } = result;
   
   const stemNames = ['drums', 'bass', 'other', 'vocals'];
   const buffers = {};
   
-  for (let s = 0; s < Math.min(stems, 4); s++) {
-    const buffer = audioContext.createBuffer(channels, samples, sampleRate);
+  for (let s = 0; s < numStems; s++) {
+    const buffer = audioContext.createBuffer(channels, length, sampleRate);
     
     for (let c = 0; c < channels; c++) {
-      const channelData = buffer.getChannelData(c);
-      const offset = s * channels * samples + c * samples;
-      
-      for (let i = 0; i < samples; i++) {
-        channelData[i] = data[offset + i];
-      }
+      buffer.getChannelData(c).set(stemData[s][c].subarray(0, length));
     }
     
     buffers[stemNames[s]] = buffer;
