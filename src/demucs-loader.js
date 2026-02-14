@@ -11,24 +11,19 @@ const MODELS = {
   htdemucs: 'https://huggingface.co/timcsy/demucs-web-onnx/resolve/main/htdemucs_embedded.onnx',
 };
 
-// Configure ONNX Runtime
-ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+// Configure ONNX Runtime for browser environment
+// Let ONNX Runtime auto-detect thread support based on crossOriginIsolated
+if (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated) {
+  ort.env.wasm.numThreads = navigator.hardwareConcurrency || 4;
+} else {
+  // Without COOP/COEP headers, SharedArrayBuffer is unavailable
+  ort.env.wasm.numThreads = 1;
+}
 ort.env.wasm.simd = true;
 
-// Try WebGPU if available
+// Disable WebGPU — WASM backend is more reliable for this use case
 async function getPreferredBackend() {
-  if ('gpu' in navigator) {
-    try {
-      const adapter = await navigator.gpu?.requestAdapter();
-      if (adapter) {
-        console.log('WebGPU available - using for acceleration');
-        return 'webgpu';
-      }
-    } catch (e) {
-      console.log('WebGPU not available:', e.message);
-    }
-  }
-  console.log('Using WASM backend');
+  console.warn('Using WASM backend for ONNX Runtime');
   return 'wasm';
 }
 
@@ -39,9 +34,12 @@ export async function loadDemucsModel(progressCallback) {
   progressCallback?.({ stage: 'downloading', percent: 0 });
   
   // Fetch with progress
-  const response = await fetch(MODELS.htdemucs);
+  const response = await fetch(MODELS.htdemucs, { mode: 'cors' });
+  if (!response.ok) {
+    throw new Error(`Failed to download model: ${response.status} ${response.statusText}`);
+  }
   const contentLength = response.headers.get('content-length');
-  const total = parseInt(contentLength, 10);
+  const total = parseInt(contentLength, 10) || 0;
   
   const reader = response.body.getReader();
   const chunks = [];
@@ -54,7 +52,7 @@ export async function loadDemucsModel(progressCallback) {
     received += value.length;
     progressCallback?.({ 
       stage: 'downloading', 
-      percent: Math.round((received / total) * 100),
+      percent: total ? Math.round((received / total) * 100) : 0,
       received,
       total
     });
@@ -70,7 +68,7 @@ export async function loadDemucsModel(progressCallback) {
   
   progressCallback?.({ stage: 'loading', percent: 0 });
   
-  // Create session
+  // Create session from ArrayBuffer (avoids MIME type issues with streaming)
   const session = await ort.InferenceSession.create(modelBuffer.buffer, {
     executionProviders: [backend],
     graphOptimizationLevel: 'all',
@@ -78,9 +76,9 @@ export async function loadDemucsModel(progressCallback) {
   
   progressCallback?.({ stage: 'ready', percent: 100 });
   
-  console.log('Demucs model loaded!');
-  console.log('Input names:', session.inputNames);
-  console.log('Output names:', session.outputNames);
+  console.warn('Demucs model loaded!');
+  console.warn('Input names:', session.inputNames);
+  console.warn('Output names:', session.outputNames);
   
   return session;
 }
@@ -109,15 +107,15 @@ export async function separateStems(session, audioData, sampleRate) {
   
   const inputTensor = new ort.Tensor('float32', inputData, [1, channels, length]);
   
-  console.log('Running inference...');
-  console.log('Input shape:', inputTensor.dims);
+  console.warn('Running inference...');
+  console.warn('Input shape:', inputTensor.dims);
   
   // Run model
   const results = await session.run({ input: inputTensor });
   
   // Parse outputs
   const output = Object.values(results)[0];
-  console.log('Output shape:', output.dims);
+  console.warn('Output shape:', output.dims);
   
   return output;
 }
