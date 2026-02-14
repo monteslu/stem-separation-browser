@@ -4,13 +4,12 @@
  * Browser-based audio stem separation using Demucs ONNX model
  */
 
-// Unregister any stale service workers from previous dev sessions
+// Register service worker for model caching
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.getRegistrations().then(registrations => {
-    for (const registration of registrations) {
-      registration.unregister();
-      console.warn('Unregistered stale service worker:', registration.scope);
-    }
+  navigator.serviceWorker.register('/sw.js').then(reg => {
+    console.warn('Model cache service worker registered:', reg.scope);
+  }).catch(err => {
+    console.warn('Service worker registration failed:', err);
   });
 }
 
@@ -169,13 +168,16 @@ async function processAudio(file) {
     }
 
     const duration = audioBuffer.duration.toFixed(0);
-    showStatus(`🎵 Running stem separation on ${duration}s of audio... (this may take a while)`, 'loading');
-    updateProgress(10);
+    showStatus(`🎵 Running stem separation on ${duration}s of audio...`, 'loading');
+    updateProgress(5);
 
-    const result = await separateStems(session, audioBuffer, audioBuffer.sampleRate);
+    const result = await separateStems(session, audioBuffer, audioBuffer.sampleRate, (progress) => {
+      showStatus(`🎵 Processing chunk ${progress.chunk}/${progress.total} (${progress.percent}%)`, 'loading');
+      updateProgress(5 + Math.round(progress.percent * 0.9));
+    });
     
     showStatus('🎵 Extracting stems...', 'loading');
-    updateProgress(90);
+    updateProgress(95);
     const stems = extractStems(result, audioBuffer.sampleRate, getAudioContext());
 
     updateProgress(100);
